@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -13,14 +15,35 @@ import (
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/widget"
 	"github.com/jackc/pgx/v5"
 )
 
+// prefConfigPath remembers the last selected encrypted config file.
+const prefConfigPath = "configPath"
+
+// uriToOSPath converts a file URI chosen in the file dialog into a path usable
+// with os.Open. Fyne reports local Windows files as "/C:/dir/config.enc", where
+// the leading slash is not part of the OS path.
+func uriToOSPath(u fyne.URI) string {
+	p := u.Path()
+	if len(p) >= 3 && p[0] == '/' && p[2] == ':' && isASCIILetter(p[1]) {
+		return p[1:]
+	}
+	return p
+}
+
+func isASCIILetter(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
 func main() {
-	a := app.New()
+	// A unique app ID is required for the Preferences API used to remember the
+	// last selected config file.
+	a := app.NewWithID("net.hase-zheng.mitm-adm-data-debug")
 	w := a.NewWindow("MitM Admin Data Decryptor")
-	w.Resize(fyne.NewSize(900, 700))
+	w.Resize(fyne.NewSize(960, 820))
 
 	label := widget.NewLabel("Verifying Identity...")
 	w.SetContent(container.NewCenter(label))
@@ -32,22 +55,88 @@ func main() {
 			os.Exit(1)
 		}
 
-		buildUI(w)
+		fyne.Do(func() { buildUI(w) })
 	}()
 
 	w.ShowAndRun()
 }
 
 func buildUI(w fyne.Window) {
-	hostEntry := widget.NewEntry()
-	hostEntry.SetText("localhost")
-	portEntry := widget.NewEntry()
-	portEntry.SetText("5432")
-	userEntry := widget.NewEntry()
-	userEntry.SetText("mitm_user")
-	passEntry := widget.NewPasswordEntry()
-	dbNameEntry := widget.NewEntry()
-	dbNameEntry.SetText("mitm")
+	// The database connection is taken exclusively from the encrypted config
+	// file; there are no editable connection fields.
+	target := &dbTarget{}
+
+	configPathEntry := widget.NewEntry()
+	configPathEntry.SetPlaceHolder("Path to encrypted config file (*.enc)")
+	configPasswordEntry := widget.NewPasswordEntry()
+	configPasswordEntry.SetPlaceHolder("Password of the encrypted config file")
+	configStatus := widget.NewLabel("No config file loaded - load an encrypted config file to enable the DB connection.")
+	configStatus.Wrapping = fyne.TextWrapWord
+
+	loadConfig := func() {
+		path := strings.TrimSpace(configPathEntry.Text)
+		if path == "" {
+			dialog.ShowError(errors.New("Please select an encrypted config file first."), w)
+			return
+		}
+		password := configPasswordEntry.Text
+		if password == "" {
+			dialog.ShowError(errors.New("Please enter the password of the encrypted config file."), w)
+			return
+		}
+
+		configStatus.SetText("Decrypting " + filepath.Base(path) + " ...")
+		go func() {
+			cfg, err := LoadEncryptedDBConfig(path, password)
+			fyne.Do(func() {
+				if err != nil {
+					target.clear()
+					configStatus.SetText("Loading " + filepath.Base(path) + " failed - no database connection available.")
+					dialog.ShowError(err, w)
+					return
+				}
+
+				target.set(cfg)
+				configStatus.SetText(fmt.Sprintf("Loaded %s", filepath.Base(path)))
+				fyne.CurrentApp().Preferences().SetString(prefConfigPath, path)
+			})
+		}()
+	}
+
+	browseBtn := widget.NewButton("Browse...", func() {
+		fd := dialog.NewFileOpen(func(reader fyne.URIReadCloser, err error) {
+			if err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+			if reader == nil {
+				return
+			}
+			defer reader.Close()
+			configPathEntry.SetText(uriToOSPath(reader.URI()))
+		}, w)
+		fd.SetFilter(storage.NewExtensionFileFilter([]string{".enc"}))
+		if dir := filepath.Dir(strings.TrimSpace(configPathEntry.Text)); dir != "." && dir != "" {
+			if lister, err := storage.ListerForURI(storage.NewFileURI(dir)); err == nil {
+				fd.SetLocation(lister)
+			}
+		}
+		// Do not call fd.Resize here: FileDialog.Resize dereferences the internal
+		// dialog, which only exists after Show, and an explicitly enlarged
+		// dialog overflows the parent window because the size is not clamped.
+		fd.Show()
+	})
+
+	loadBtn := widget.NewButton("Load Config", loadConfig)
+	loadBtn.Importance = widget.HighImportance
+	configPasswordEntry.OnSubmitted = func(string) { loadConfig() }
+
+	if lastPath := fyne.CurrentApp().Preferences().String(prefConfigPath); lastPath != "" {
+		configPathEntry.SetText(lastPath)
+	}
+
+	// dsn returns the connection string of the loaded config file.
+	dsn := func() (string, error) { return target.connString() }
 
 	masterkeyEntry := widget.NewPasswordEntry()
 
@@ -56,32 +145,37 @@ func buildUI(w fyne.Window) {
 
 	jsonOutput := widget.NewMultiLineEntry()
 
-	connectBtn := widget.NewButton("Connect & Test DB", func() {
-		host := hostEntry.Text
-		port := portEntry.Text
-		user := userEntry.Text
-		pass := passEntry.Text
-		dbname := dbNameEntry.Text
-		connString := fmt.Sprintf("postgres://%s:%s@%s:%s/%s", user, pass, host, port, dbname)
-
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		conn, err := pgx.Connect(ctx, connString)
+	var connectBtn *widget.Button
+	connectBtn = widget.NewButton("Connect & Test DB", func() {
+		dsn, err := dsn()
 		if err != nil {
-			dialog.ShowError(fmt.Errorf("DB connection failed:\n%v", err), w)
+			dialog.ShowError(err, w)
 			return
 		}
-		defer conn.Close(ctx)
-		dialog.ShowInformation("Success", "Successfully connected to PostgreSQL DB!", w)
+
+		connectBtn.Disable()
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			conn, err := pgx.Connect(ctx, dsn)
+			if err != nil {
+				fyne.Do(func() {
+					connectBtn.Enable()
+					dialog.ShowError(fmt.Errorf("DB connection failed:\n%v", err), w)
+				})
+				return
+			}
+			conn.Close(ctx)
+
+			fyne.Do(func() {
+				connectBtn.Enable()
+				dialog.ShowInformation("Success", "Successfully connected to PostgreSQL DB!", w)
+			})
+		}()
 	})
 
 	decryptBtn := widget.NewButton("Decrypt", func() {
-		host := hostEntry.Text
-		port := portEntry.Text
-		user := userEntry.Text
-		pass := passEntry.Text
-		dbname := dbNameEntry.Text
 		mkBase64 := masterkeyEntry.Text
 
 		mk, err := base64.StdEncoding.DecodeString(mkBase64)
@@ -89,7 +183,11 @@ func buildUI(w fyne.Window) {
 			mk = []byte(mkBase64)
 		}
 
-		connString := fmt.Sprintf("postgres://%s:%s@%s:%s/%s", user, pass, host, port, dbname)
+		dsn, err := dsn()
+		if err != nil {
+			dialog.ShowError(err, w)
+			return
+		}
 
 		inputTxt := strings.TrimSpace(jsonInput.Text)
 		if inputTxt == "" {
@@ -108,37 +206,42 @@ func buildUI(w fyne.Window) {
 		jsonOutput.SetText("Decrypting...")
 
 		go func() {
-			processed, err := processJSON(parsed, connString, mk)
+			processed, err := processJSON(parsed, dsn, mk)
 			if err != nil {
-				jsonOutput.SetText(fmt.Sprintf("Error: %v", err))
+				fyne.Do(func() { jsonOutput.SetText(fmt.Sprintf("Error: %v", err)) })
 				return
 			}
 
 			outBytes, _ := json.MarshalIndent(processed, "", "  ")
-			jsonOutput.SetText(string(outBytes))
+			fyne.Do(func() { jsonOutput.SetText(string(outBytes)) })
 		}()
 	})
 
 	form := container.NewVBox(
-		widget.NewLabel("PostgreSQL Connection"),
-		container.NewGridWithColumns(2,
-			widget.NewLabel("Host/Proxy:"), hostEntry,
-			widget.NewLabel("Port:"), portEntry,
-			widget.NewLabel("User:"), userEntry,
-			widget.NewLabel("Password:"), passEntry,
-			widget.NewLabel("Database:"), dbNameEntry,
-		),
+		widget.NewLabelWithStyle("Encrypted Config File", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		container.NewBorder(nil, nil, nil, browseBtn, configPathEntry),
+		container.NewBorder(nil, nil, nil, loadBtn, configPasswordEntry),
+		configStatus,
 		connectBtn,
-		widget.NewLabel("Masterkey (Base64 or Raw):"),
-		masterkeyEntry,
-		widget.NewLabel("Encrypted JSON Snippet:"),
 	)
 
 	inputScroll := container.NewScroll(jsonInput)
-	inputScroll.SetMinSize(fyne.NewSize(0, 150))
+	inputScroll.SetMinSize(fyne.NewSize(0, 160))
 
 	outputScroll := container.NewScroll(jsonOutput)
-	outputScroll.SetMinSize(fyne.NewSize(0, 200))
+	outputScroll.SetMinSize(fyne.NewSize(0, 180))
+
+	inputPane := container.NewBorder(
+		container.NewVBox(
+			widget.NewLabel("Masterkey (Base64 or Raw):"),
+			masterkeyEntry,
+			widget.NewLabel("Encrypted JSON Snippet:"),
+		),
+		container.NewPadded(decryptBtn),
+		nil,
+		nil,
+		inputScroll,
+	)
 
 	content := container.NewBorder(
 		form,
@@ -146,7 +249,7 @@ func buildUI(w fyne.Window) {
 		nil,
 		nil,
 		container.NewVSplit(
-			container.NewBorder(nil, container.NewPadded(decryptBtn), nil, nil, inputScroll),
+			inputPane,
 			container.NewBorder(widget.NewLabel("Decrypted JSON Output:"), nil, nil, nil, outputScroll),
 		),
 	)

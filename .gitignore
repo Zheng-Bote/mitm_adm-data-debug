@@ -1,1 +1,13 @@
 bin/
+
+.codewhale/
+
+# Local configuration files with real credentials - never commit these.
+# testdata/db_config.enc is the synthetic test fixture (dummy credentials)
+# and is intentionally NOT ignored.
+testdata/config*.json
+testdata/config*.enc
+
+
+# waste
+main.go.pre-refactor.bak
