@@ -30,6 +30,10 @@
    ```bash
    go build -o mitm_adm-data .
    ```
+**Windows:**
+```
+go build -ldflags "-H=windowsgui" -o .\bin\mitm-adm-data.exe
+```
 
 ## Usage
 
